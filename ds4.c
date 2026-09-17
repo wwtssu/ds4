@@ -74915,6 +74915,10 @@ bool ds4_session_vision_state_matches(
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
+size_t ds4_session_vision_image_count(const ds4_session *s) {
+    return s && s->checkpoint_valid ? s->checkpoint_image_count : 0;
+}
+
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
     if (!s || !s->checkpoint_valid || (image_count && !images) ||

@@ -608,6 +608,16 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+tests/test_server_vision_prefix.o: tests/test_server_vision_prefix.c ds4_server.c ds4.h ds4_kvstore.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_server_vision_prefix: tests/test_server_vision_prefix.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)

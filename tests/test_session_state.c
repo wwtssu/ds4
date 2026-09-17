@@ -7,6 +7,7 @@ static void test_vision_prefix(void) {
     ds4_session *s = calloc(1, sizeof(*s));
     assert(s);
     s->checkpoint_valid = true;
+    assert(ds4_session_vision_image_count(s) == 0);
     s->checkpoint.len = 100;
     ds4_vision_span images[2] = {
         {.token_start = 100, .embedding = {.token_count = 10, .fingerprint = {1}}},
@@ -20,6 +21,7 @@ static void test_vision_prefix(void) {
     ds4_vision_identity old = {.token_start = 50, .token_count = 10, .fingerprint = {1}};
     s->checkpoint_images = &old;
     s->checkpoint_image_count = 1;
+    assert(ds4_session_vision_image_count(s) == 1);
     images[0].token_start = 50;
     assert(ds4_session_vision_state_matches(s, images, 1));
     assert(ds4_session_vision_prefix_matches(s, images, 2));
@@ -66,6 +68,7 @@ static void test_vision_prefix(void) {
     assert(!ds4_session_rebase_vision_state(s, swapped, 2));
     assert(!ds4_session_vision_prefix_matches(s, swapped, 2));
     s->checkpoint_valid = false;
+    assert(ds4_session_vision_image_count(s) == 0);
     assert(!ds4_session_vision_prefix_matches(s, images, 2));
     assert(!ds4_session_rebase_vision_state(s, images, 2));
     free(s);

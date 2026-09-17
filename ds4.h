@@ -460,6 +460,8 @@ bool ds4_session_vision_state_matches(const ds4_session *s,
  * on failure, leaves spans unchanged. This does not verify the text history. */
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
+/* Number of image identities in the valid live checkpoint (zero if invalid). */
+size_t ds4_session_vision_image_count(const ds4_session *s);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);

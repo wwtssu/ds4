@@ -143,6 +143,23 @@ part of the prefix.
 Use `--trace /tmp/ds4-trace.txt` to record prompt rendering, cache decisions,
 generated text, and tool-parser events. Traces can contain sensitive content.
 
+Live text-prefix reuse also handles image histories when sampled tokens and
+re-tokenized request text have different BPE spellings. Historical image blocks
+are matched at their transcript positions and checked against their stored
+fingerprints and row counts before the new suffix is appended. Qwen and GLM
+image start/end tokens are retained during that append. Changed or removed
+historical images still reject reuse; image-conditioned disk caching is not
+enabled by this fallback.
+
+The short real-model regression covers text → PNG → WebP, sampled BPE drift,
+changed history, and cold replay:
+
+```sh
+make tests/test_server_vision_prefix
+./tests/test_server_vision_prefix MODEL.gguf MMPROJ.gguf
+./tests/test_server_vision_prefix MODEL.gguf MMPROJ.gguf 1024
+```
+
 Cache formats are implementation details. The current header and extension
 definitions are in [ds4_kvstore.h](../ds4_kvstore.h) and
 [ds4_kvstore.c](../ds4_kvstore.c); model-specific payload handling is in

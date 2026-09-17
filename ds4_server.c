@@ -11451,6 +11451,12 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+static int server_image_token_wrapper(server *s) {
+    /* GLM and Qwen put start/end tokens outside the embedding span. DeepSeek
+     * includes its sentinels in the span itself. Keep both when splicing. */
+    return ds4_engine_is_glm_dsa(s->engine) || ds4_engine_is_qwen4(s->engine);
+}
+
 /* A text-only suffix tokenizer would turn image markers into literal text.
  * Keep the exact live tokens and splice each new image's already-built token
  * block into the suffix. Historical image positions follow the live frontier,
@@ -11472,7 +11478,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
-    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    const int wrapper = server_image_token_wrapper(s);
     for (size_t i = old_count; i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
@@ -11502,6 +11508,51 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     return true;
 }
 
+/* Render historical image blocks with this request's markers, not the image
+ * pad tokens' text. Fingerprints and row counts authenticate the images first;
+ * the subsequent byte-prefix comparison authenticates their positions in the
+ * transcript. This also handles sampled BPE spellings with different lengths
+ * from the incoming prompt, without modifying either token history. */
+static char *render_live_prompt_text(server *s, server_slot *slot,
+                                     const request *req, size_t *out_len) {
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const size_t count = ds4_session_vision_image_count(slot->session);
+    if (!live || count > req->image_count || count > 16) return NULL;
+    if (count == 0) return render_tokens_text(s->engine, live, out_len);
+    if (!req->images || !req->image_markers) return NULL;
+    ds4_vision_span spans[16];
+    memcpy(spans, req->images, count * sizeof(spans[0]));
+    if (!ds4_session_rebase_vision_state(slot->session, spans, count)) return NULL;
+
+    buf text = {0};
+    int cursor = 0;
+    const int wrapper = server_image_token_wrapper(s);
+    for (size_t i = 0; i < count; i++) {
+        int64_t start = (int64_t)spans[i].token_start - wrapper;
+        uint64_t end = (uint64_t)spans[i].token_start +
+                       spans[i].embedding.token_count + wrapper;
+        if (start < cursor || end > (uint64_t)live->len ||
+            !req->image_markers[i][0]) {
+            buf_free(&text);
+            return NULL;
+        }
+        ds4_tokens part = {.v = live->v + cursor, .len = (int)start - cursor};
+        size_t len = 0;
+        char *piece = render_tokens_text(s->engine, &part, &len);
+        buf_append(&text, piece, len);
+        free(piece);
+        buf_puts(&text, req->image_markers[i]);
+        cursor = (int)end;
+    }
+    ds4_tokens part = {.v = live->v + cursor, .len = live->len - cursor};
+    size_t len = 0;
+    char *piece = render_tokens_text(s->engine, &part, &len);
+    buf_append(&text, piece, len);
+    free(piece);
+    if (out_len) *out_len = text.len;
+    return buf_take(&text);
+}
+
 static int live_text_prefix_prompt(server *s, server_slot *slot,
                                    const request *req,
                                    ds4_tokens *effective_prompt) {
@@ -11510,7 +11561,8 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
+    char *live_text = render_live_prompt_text(s, slot, req, &live_text_len);
+    if (!live_text) return 0;
     const size_t prompt_text_len = strlen(req->prompt_text);
     if (!byte_prefix_match(req->prompt_text, prompt_text_len,
                            live_text, live_text_len))
