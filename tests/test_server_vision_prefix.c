@@ -54,13 +54,24 @@ static void sync_images(server_slot *slot, request *req, ds4_tokens *tokens) {
     expect(ds4_session_sync_multimodal(slot->session, tokens, req->images,
             req->image_count, err, sizeof(err)) == 0, err);
     expect(ds4_session_pos(slot->session) == tokens->len, "sync frontier");
+    slot_refresh_live_text(slot->srv, slot, req);
+}
+
+/* Exercise the same probe and materialization used by dispatch and workers. */
+static int reuse_text_prefix(server *s, server_slot *slot, request *req,
+                              ds4_tokens *out) {
+    slot_reuse reuse = slot_probe_reuse(s, slot, req);
+    if (reuse.kind != REUSE_MEMORY_TEXT) return 0;
+    if (!build_live_prompt_suffix(s, slot, req,
+                                  req->prompt_text + reuse.suffix_off, out)) return 0;
+    return reuse.reuse_tokens;
 }
 
 static void check_rejected(server *s, server_slot *slot, request *req, const char *why) {
     ds4_tokens out = {0};
     uint32_t before[16];
     for (size_t i = 0; i < req->image_count; i++) before[i] = req->images[i].token_start;
-    expect(live_text_prefix_prompt(s, slot, req, &out) == 0, why);
+    expect(reuse_text_prefix(s, slot, req, &out) == 0, why);
     for (size_t i = 0; i < req->image_count; i++)
         expect(req->images[i].token_start == before[i], "rejection leaves positions intact");
     expect(out.len == 0, "rejection leaves output intact");
@@ -76,6 +87,7 @@ int main(int argc, char **argv) {
     expect(chunk > 0 && chunk <= 2048, "prefill chunk must be 1..2048");
     server s = {0};
     pthread_mutex_init(&s.inference_mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     ds4_engine_options opt = {.model_path = argv[1], .vision_path = argv[2],
@@ -87,7 +99,7 @@ int main(int argc, char **argv) {
         .context_size = 2048, .prefill_chunk = (uint32_t)chunk};
     expect(ds4_engine_open(&s.engine, &opt) == 0, "open engine");
     expect(ds4_engine_is_qwen4(s.engine), "Qwen fixture requires Qwen engine");
-    server_slot slot = {0};
+    server_slot slot = {.srv = &s};
     expect(ds4_session_create(&slot.session, s.engine, 2048) == 0, "create session");
     ds4_tokens live = {0}, canonical = {0}, effective = {0};
     ds4_tokenize_rendered_chat(s.engine, "<|im_start|>user\nfirst press", &live);
@@ -96,10 +108,11 @@ int main(int argc, char **argv) {
     expect(live.len != canonical.len, "fixture must have BPE drift");
     char err[256] = {0};
     expect(ds4_session_sync(slot.session, &live, err, sizeof(err)) == 0, err);
+    slot_refresh_live_text(&s, &slot, NULL);
 
     request first = image_request(&s, 1, " after ");
     int old = live.len;
-    expect(live_text_prefix_prompt(&s, &slot, &first, &effective) == old,
+    expect(reuse_text_prefix(&s, &slot, &first, &effective) == old,
            "text to first image reuses sampled tokens");
     expect(effective.v[old] == first.prompt.v[canonical.len], "keep Qwen vision-start token");
     expect(first.images[0].token_start == (uint32_t)old + 1, "image starts after wrapper");
@@ -147,7 +160,7 @@ int main(int argc, char **argv) {
     check_rejected(&s, &slot, &second, "removed images");
     second.image_count = count;
 
-    expect(live_text_prefix_prompt(&s, &slot, &second, &effective) == old,
+    expect(reuse_text_prefix(&s, &slot, &second, &effective) == old,
            "second image reuses the complete live frontier");
     expect(second.images[0].token_start == first.images[0].token_start,
            "historical image rebased to sampled frontier");
@@ -199,7 +212,7 @@ int main(int argc, char **argv) {
 
     request follow = image_request(&s, 2, " done plus");
     old = ds4_session_pos(slot.session);
-    expect(live_text_prefix_prompt(&s, &slot, &follow, &effective) == old,
+    expect(reuse_text_prefix(&s, &slot, &follow, &effective) == old,
            "unchanged images and new nonces reuse cache");
     ds4_vision_span swap = follow.images[0];
     follow.images[0] = follow.images[1];
@@ -214,6 +227,7 @@ int main(int argc, char **argv) {
     ds4_tokens_free(&canonical);
     ds4_tokens_free(&live);
     ds4_session_free(slot.session);
+    free(slot.live_text);
     server_image_cache_clear(&s.image_cache);
     ds4_engine_close(s.engine);
     puts("PASS: BPE drift, first/second image, wrappers, identity guards and cold replay");

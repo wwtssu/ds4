@@ -151,6 +151,10 @@ image start/end tokens are retained during that append. Changed or removed
 historical images still reject reuse; image-conditioned disk caching is not
 enabled by this fallback.
 
+The per-slot text key normalizes image markers and records their byte offsets
+after each request, so the shared routing/execution probe recognizes the same
+image prefix even when the next request carries fresh marker nonces.
+
 The short real-model regression covers text → PNG → WebP, sampled BPE drift,
 changed history, and cold replay:
 
