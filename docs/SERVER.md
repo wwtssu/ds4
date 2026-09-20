@@ -38,6 +38,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Explain Redis streams."}],"stream":true}'
 ```
 
+Qwen tool arguments stream incrementally on Chat Completions (`tool_calls`
+deltas) and Anthropic (`input_json_delta`). Parameters declared as strings in
+the tool schema stream during generation; other parameters are emitted when
+their closing delimiter makes the JSON-or-string type unambiguous. Tool IDs
+remain stable across deltas and subsequent tool results. No extra flag is needed.
+The opt-in live test is `python3 tests/test_qwen_tool_deltas.py --base-url URL`
+(add `--thinking` to check reasoning-enabled requests).
+
 Chat, Responses, and Anthropic support tools and SSE streaming. Reasoning is
 returned separately from visible text in each API's native form. Standard
 sampling and output-budget fields are supported; explicit request parameters

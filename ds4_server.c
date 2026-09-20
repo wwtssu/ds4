@@ -7162,6 +7162,28 @@ typedef enum {
     DSML_TOOL_ERROR,
 } dsml_tool_stream_state;
 
+typedef enum {
+    QWEN_TOOL_START, QWEN_TOOL_FUNCTION, QWEN_TOOL_PARAM,
+    QWEN_TOOL_VALUE, QWEN_TOOL_END, QWEN_TOOL_ERROR,
+} qwen_tool_stream_state;
+
+typedef struct {
+    qwen_tool_stream_state state;
+    size_t pos;
+    char *name;
+    char *key;
+    bool enabled;
+    bool first_param;
+    bool string_value;
+    bool value_started;
+} qwen_tool_stream;
+
+static void qwen_tool_stream_free(qwen_tool_stream *ts) {
+    free(ts->name);
+    free(ts->key);
+    memset(ts, 0, sizeof(*ts));
+}
+
 /* Shared states for protocol-specific DSML stream projections.  The model
  * still samples DSML; these states only translate already-sampled bytes into
  * OpenAI / Anthropic wire events while final parsing remains authoritative. */
@@ -7181,6 +7203,7 @@ typedef struct {
     bool param_is_string;
     char **ids;
     int ids_cap;
+    qwen_tool_stream qwen;
 } openai_tool_stream;
 
 typedef struct {
@@ -7208,6 +7231,7 @@ static void openai_stream_start(const request *r, openai_stream *st) {
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
+    qwen_tool_stream_free(&ts->qwen);
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     ts->ids = NULL;
@@ -7790,6 +7814,163 @@ static size_t tool_param_value_stream_safe_len(const char *raw, size_t start,
     return utf8_stream_safe_len(raw, start, limit, false);
 }
 
+typedef enum { QWEN_DELTA_START, QWEN_DELTA_ARGS, QWEN_DELTA_END } qwen_delta_kind;
+typedef bool (*qwen_delta_emit)(void *ctx, qwen_delta_kind kind,
+                                const char *text, size_t len);
+
+static bool qwen_tool_emit_key(qwen_tool_stream *ts, bool is_string,
+                               qwen_delta_emit emit, void *ctx) {
+    buf frag = {0};
+    if (!ts->first_param) buf_putc(&frag, ',');
+    ts->first_param = false;
+    json_escape(&frag, ts->key);
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = emit(ctx, QWEN_DELTA_ARGS, frag.ptr, frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+static bool qwen_tool_emit_string(const char *text, size_t len,
+                                  qwen_delta_emit emit, void *ctx) {
+    if (!len) return true;
+    char *value = xstrndup(text, len);
+    ds4_tool_text_unescape(value, "</parameter>");
+    buf frag = {0};
+    json_escape_fragment_n(&frag, value, strlen(value));
+    bool ok = emit(ctx, QWEN_DELTA_ARGS, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(value);
+    return ok;
+}
+
+/* Qwen omits parameter types. Declared strings can stream immediately; other
+ * values must wait for their parameter delimiter to preserve the final parser's
+ * JSON-or-string inference (e.g. "123" can still become "123 Main Street").
+ * Offsets refer to the sampled transcript, which remains unchanged for KV reuse.
+ * Only wire events are shared: each API adapter owns its ids/block lifecycle. */
+static bool qwen_tool_stream_update(qwen_tool_stream *ts, const request *r,
+                                    const char *raw, size_t raw_len,
+                                    qwen_delta_emit emit, void *ctx) {
+    while (ts->pos < raw_len && ts->state != QWEN_TOOL_ERROR) {
+        if (ts->state == QWEN_TOOL_VALUE) {
+            if (!ts->value_started) {
+                if (raw[ts->pos] == '\n') ts->pos++;
+                ts->value_started = true;
+            }
+            const char *end = find_lit_bounded(raw + ts->pos, raw_len - ts->pos,
+                                               "</parameter>");
+            size_t limit = end ? (size_t)(end - raw) :
+                tool_param_value_stream_safe_len(raw, ts->pos, raw_len,
+                                                  "</parameter>", true);
+            /* The template's one trailing newline is not argument data. Hold
+             * it until the next byte tells us whether it precedes the delimiter. */
+            if (limit > ts->pos && raw[limit - 1] == '\n') limit--;
+            if (ts->string_value) {
+                if (!qwen_tool_emit_string(raw + ts->pos, limit - ts->pos, emit, ctx)) return false;
+                ts->pos = limit;
+            } else if (end) {
+                char *value = xstrndup(raw + ts->pos, limit - ts->pos);
+                bool is_string = !qwen_param_value_is_json(value);
+                bool ok = qwen_tool_emit_key(ts, is_string, emit, ctx);
+                if (ok) ok = is_string ? qwen_tool_emit_string(value, strlen(value), emit, ctx) :
+                                        emit(ctx, QWEN_DELTA_ARGS, value, strlen(value));
+                free(value);
+                if (!ok) return false;
+                ts->string_value = is_string;
+            }
+            if (!end) return true;
+            if (ts->string_value && !emit(ctx, QWEN_DELTA_ARGS, "\"", 1)) return false;
+            ts->pos = (size_t)(end - raw) + strlen("</parameter>");
+            free(ts->key);
+            ts->key = NULL;
+            ts->state = QWEN_TOOL_PARAM;
+            continue;
+        }
+
+        while (ts->pos < raw_len && isspace((unsigned char)raw[ts->pos])) ts->pos++;
+        if (ts->pos == raw_len) return true;
+        const char *lit = ts->state == QWEN_TOOL_START ? "<tool_call>" :
+                          ts->state == QWEN_TOOL_FUNCTION ? "<function=" :
+                          ts->state == QWEN_TOOL_END ? "</tool_call>" : "<parameter=";
+        if (ts->state == QWEN_TOOL_PARAM) {
+            if (raw_partial_lit(raw, raw_len, ts->pos, "</function>")) return true;
+            if (raw_full_lit(raw, raw_len, ts->pos, "</function>")) {
+                ts->pos += strlen("</function>");
+                ts->state = QWEN_TOOL_END;
+                continue;
+            }
+        }
+        if (raw_partial_lit(raw, raw_len, ts->pos, lit)) return true;
+        if (!raw_full_lit(raw, raw_len, ts->pos, lit)) {
+            ts->state = QWEN_TOOL_ERROR;
+            return true;
+        }
+        size_t body = ts->pos + strlen(lit);
+        if (ts->state == QWEN_TOOL_START) {
+            ts->pos = body;
+            ts->state = QWEN_TOOL_FUNCTION;
+        } else if (ts->state == QWEN_TOOL_END) {
+            if (!emit(ctx, QWEN_DELTA_ARGS, "}", 1) ||
+                !emit(ctx, QWEN_DELTA_END, NULL, 0)) return false;
+            ts->pos = body;
+            ts->state = QWEN_TOOL_START;
+            free(ts->name);
+            ts->name = NULL;
+        } else {
+            const char *end = memchr(raw + body, '>', raw_len - body);
+            if (!end) return true;
+            const char *start = raw + body, *trim_end = end;
+            trim_const_span(&start, &trim_end);
+            if (memchr(start, '<', (size_t)(trim_end - start)) ||
+                (ts->state == QWEN_TOOL_FUNCTION && start == trim_end)) {
+                ts->state = QWEN_TOOL_ERROR;
+                return true;
+            }
+            char *name = xstrndup(start, (size_t)(trim_end - start));
+            ts->pos = (size_t)(end - raw) + 1;
+            if (ts->state == QWEN_TOOL_FUNCTION) {
+                ts->name = name;
+                if (!emit(ctx, QWEN_DELTA_START, name, strlen(name)) ||
+                    !emit(ctx, QWEN_DELTA_ARGS, "{", 1)) return false;
+                ts->first_param = true;
+                ts->state = QWEN_TOOL_PARAM;
+            } else {
+                ts->key = name;
+                ts->string_value = qwen_param_declared_string(&r->tool_orders, ts->name, name);
+                if (ts->string_value && !qwen_tool_emit_key(ts, true, emit, ctx)) return false;
+                ts->value_started = false;
+                ts->state = QWEN_TOOL_VALUE;
+            }
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    int fd;
+    server *s;
+    const request *r;
+    const char *id;
+    openai_tool_stream *ts;
+} openai_qwen_delta_ctx;
+
+static bool openai_qwen_emit(void *opaque, qwen_delta_kind kind,
+                             const char *text, size_t len) {
+    openai_qwen_delta_ctx *ctx = opaque;
+    openai_tool_stream *ts = ctx->ts;
+    if (kind == QWEN_DELTA_START) {
+        if (!sse_chat_tool_call_start_delta(ctx->fd, ctx->r, ctx->id, ts->index,
+                openai_tool_stream_id(ctx->s, ts, ts->index), text)) return false;
+        ts->emitted_any = true;
+    } else if (kind == QWEN_DELTA_ARGS) {
+        return sse_chat_tool_call_args_delta_n(ctx->fd, ctx->r, ctx->id, ts->index, text, len);
+    } else {
+        ts->index++;
+    }
+    return true;
+}
+
 static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
                                            openai_tool_stream *ts,
                                            const char *text, size_t len) {
@@ -7824,14 +8005,18 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
+static bool openai_tool_stream_init(openai_tool_stream *ts, const request *r, const char *raw,
                                     size_t raw_len, size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS41_TOOL_CALLS_START)) {
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        ts->qwen.enabled = true;
+        ts->qwen.pos = pos;
+    } else if (raw_full_lit(raw, raw_len, pos, DS41_TOOL_CALLS_START)) {
         ts->parse_pos += strlen(DS41_TOOL_CALLS_START);
         ts->tool_calls_end = DS41_TOOL_CALLS_END;
         ts->invoke_start = DS41_INVOKE_START;
@@ -7944,6 +8129,12 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
 static bool openai_tool_stream_update(int fd, server *s, const request *r, const char *id,
                                       openai_tool_stream *ts,
                                       const char *raw, size_t raw_len) {
+    if (ts->qwen.enabled) {
+        openai_qwen_delta_ctx ctx = {fd, s, r, id, ts};
+        bool ok = qwen_tool_stream_update(&ts->qwen, r, raw, raw_len, openai_qwen_emit, &ctx);
+        if (ts->qwen.state == QWEN_TOOL_ERROR) ts->active = false;
+        return ok;
+    }
     while (ts->active && ts->parse_pos < raw_len) {
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
@@ -8118,7 +8309,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (openai_tool_stream_init(&st->tool, r, raw, raw_len, st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -9172,6 +9363,7 @@ typedef struct {
     bool param_is_string;
     char **ids;
     int ids_cap;
+    qwen_tool_stream qwen;
 } anthropic_tool_stream;
 
 /* Anthropic streaming uses the same sampled DSML bytes that will later be
@@ -9217,6 +9409,7 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
 static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     if (!ts) return;
+    qwen_tool_stream_free(&ts->qwen);
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     ts->ids = NULL;
@@ -9422,13 +9615,19 @@ static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
  * content-block lifecycle local.  A callback abstraction would save lines, but
  * it would hide the different block/stop semantics that make this code easy to
  * audit when a client reports a streaming regression. */
-static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
+static bool anthropic_tool_stream_init(anthropic_tool_stream *ts, const request *r,
                                        const char *raw, size_t raw_len,
                                        size_t pos) {
     anthropic_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        ts->qwen.enabled = true;
+        ts->qwen.pos = pos;
+        return true;
+    }
     for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
         const dsml_syntax *syn = &dsml_syntaxes[i];
         if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
@@ -9522,10 +9721,40 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
-                                         anthropic_stream *st,
-                                         const char *raw, size_t raw_len) {
+typedef struct {
+    int fd;
+    server *s;
+    const char *id;
+    anthropic_stream *st;
+} anthropic_qwen_delta_ctx;
+
+static bool anthropic_qwen_emit(void *opaque, qwen_delta_kind kind,
+                                const char *text, size_t len) {
+    anthropic_qwen_delta_ctx *ctx = opaque;
+    anthropic_tool_stream *ts = &ctx->st->tool;
+    if (kind == QWEN_DELTA_START) {
+        if (!anthropic_sse_open_tool_block(ctx->fd, ctx->st,
+                anthropic_tool_stream_id(ctx->s, ts, ts->index), text)) return false;
+        ts->emitted_any = true;
+    } else if (kind == QWEN_DELTA_ARGS) {
+        return anthropic_sse_tool_delta_live(ctx->fd, ctx->st, text, len);
+    } else {
+        if (!anthropic_sse_close_block_live(ctx->fd, ctx->id, ctx->st)) return false;
+        ts->index++;
+    }
+    return true;
+}
+
+static bool anthropic_tool_stream_update(int fd, server *s, const request *r, const char *id,
+                                          anthropic_stream *st,
+                                          const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
+    if (ts->qwen.enabled) {
+        anthropic_qwen_delta_ctx ctx = {fd, s, id, st};
+        bool ok = qwen_tool_stream_update(&ts->qwen, r, raw, raw_len, anthropic_qwen_emit, &ctx);
+        if (ts->qwen.state == QWEN_TOOL_ERROR) ts->active = false;
+        return ok;
+    }
     while (ts->active && ts->parse_pos < raw_len) {
         if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
             while (ts->parse_pos < raw_len && isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
@@ -9760,7 +9989,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
             if (!final &&
-                anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                anthropic_tool_stream_init(&st->tool, r, raw, raw_len, st->emit_pos)) {
                 st->mode = ANTH_STREAM_TOOL;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -9772,7 +10001,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (!anthropic_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
@@ -9844,6 +10073,13 @@ static bool anthropic_sse_finish_live(int fd, server *s, const request *r, const
                                       size_t raw_len, const tool_calls *calls,
                                       const char *finish, int completion_tokens) {
     if (!anthropic_sse_stream_update(fd, s, r, id, st, raw, raw_len, true)) return false;
+
+    /* A length-limited Qwen call may have exposed partial input without ever
+     * reaching </tool_call>. End the wire block, but do not invent JSON bytes
+     * or count it as a completed/remembered invocation. */
+    if (st->tool.qwen.enabled && st->open_block == ANTH_BLOCK_TOOL &&
+        (!calls || calls->len <= st->tool.index) &&
+        !anthropic_sse_close_block_live(fd, id, st)) return false;
 
     if (st->sent_thinking && !st->sent_text && (!calls || calls->len == 0)) {
         if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_TEXT)) return false;
@@ -17665,6 +17901,199 @@ static void test_openai_stream_usage_reports_cache_details(void) {
     close(sv[1]);
 }
 
+static void test_drain_stream(int fd, buf *out) {
+    char bytes[4096];
+    ssize_t n;
+    while ((n = recv(fd, bytes, sizeof(bytes), MSG_DONTWAIT)) > 0)
+        buf_append(out, bytes, (size_t)n);
+    TEST_ASSERT(n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
+static void test_qwen_tool_argument_deltas(void) {
+    const char *body =
+        "<tool_call>\n<function= bash >\n<parameter= command >\n"
+        "echo partial 中文 \"quotes\" \\path\n\n"
+        "&lt;/parameter> &amp;lt;/parameter> &amp; &lt; "
+        "literal </tool_call> <tool_call> </think>\n</parameter>\n"
+        "<parameter=timeout>\n10\n</parameter>\n"
+        "<parameter=opts>\n{\"a\": [1, 2], \"s\": \"&amp;\"}\n</parameter>\n"
+        "<parameter=flag>true</parameter><parameter=nil>null</parameter>"
+        "<parameter=unknown>123 Main Street</parameter>"
+        "<parameter=quoted>\"quoted text\"</parameter>"
+        "<parameter=empty>\n</parameter><parameter=description>\n123\n\n</parameter>"
+        "</function>\n</tool_call>\n"
+        "<tool_call><function=bash><parameter=command>\n</parameter>"
+        "</function></tool_call><tool_call><function=no_args></function></tool_call>";
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        for (int thinking = 0; thinking < 2; thinking++) {
+            /* One-byte chunks exercise UTF-8, every tag/entity boundary and
+             * the optional template newlines. Larger chunks cross states. */
+            for (int chunk = 1; chunk <= 18; chunk++) {
+                int sv[2];
+                TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+                request r;
+                request_init(&r, REQ_CHAT, 2048);
+                r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+                r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+                r.stream = r.has_tools = true;
+                r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+                r.tool_orders = make_bash_order();
+                openai_stream os = {0};
+                anthropic_stream as = {0};
+                if (anthropic) TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "qwen_delta", 10, &as));
+                else openai_stream_start(&r, &os);
+                buf raw = {0}, wire = {0};
+                if (thinking) buf_puts(&raw, "<think>plan\n</think>\n\n");
+                buf_puts(&raw, body);
+                size_t partial_end = (size_t)(strstr(raw.ptr, "echo partial") - raw.ptr) + strlen("echo partial");
+                bool checked_partial = false;
+                for (size_t pos = 0; pos < raw.len;) {
+                    size_t n = chunk == 18 ? raw.len : (size_t)chunk;
+                    pos = pos + n < raw.len ? pos + n : raw.len;
+                    char *prefix = xstrndup(raw.ptr, pos);
+                    bool ok = anthropic ?
+                        anthropic_sse_stream_update(sv[0], NULL, &r, "qwen_delta", &as, prefix, pos, false) :
+                        openai_sse_stream_update(sv[0], NULL, &r, "qwen_delta", &os, prefix, pos, false);
+                    TEST_ASSERT(ok);
+                    free(prefix);
+                    test_drain_stream(sv[1], &wire);
+                    if (!checked_partial && pos >= partial_end && chunk != 18) {
+                        TEST_ASSERT(anthropic ? as.tool.emitted_any : os.tool.emitted_any);
+                        TEST_ASSERT((anthropic ? as.tool.index : os.tool.index) == 0);
+                        const char *field = anthropic ? "\"partial_json\":" : "\"arguments\":";
+                        buf args = {0};
+                        for (const char *p = wire.ptr; (p = strstr(p, field));) {
+                            p += strlen(field);
+                            char *frag = NULL;
+                            TEST_ASSERT(json_string(&p, &frag));
+                            if (frag) buf_puts(&args, frag);
+                            free(frag);
+                        }
+                        TEST_ASSERT(args.ptr && strstr(args.ptr, "echo partial"));
+                        TEST_ASSERT(!strstr(wire.ptr, "[DONE]"));
+                        buf_free(&args);
+                        checked_partial = true;
+                    }
+                }
+                tool_calls calls = {0};
+                char *content = NULL, *reasoning = NULL;
+                TEST_ASSERT(parse_qwen_generated_message_ex(raw.ptr, thinking, &content, &reasoning, &calls, &r.tool_orders));
+                TEST_ASSERT(calls.len == 3);
+                if (anthropic) {
+                    apply_anthropic_stream_tool_ids(&calls, &as);
+                    TEST_ASSERT(as.tool.index == 3);
+                    TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "qwen_delta", &as,
+                                                         raw.ptr, raw.len, &calls, "tool_calls", 200));
+                } else {
+                    apply_openai_stream_tool_ids(&calls, &os);
+                    TEST_ASSERT(os.tool.index == 3);
+                    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "qwen_delta", &os,
+                                                       raw.ptr, raw.len, &calls, "tool_calls", 10, 200));
+                }
+                test_drain_stream(sv[1], &wire);
+                buf arguments[3] = {{0}};
+                int call_index = -1;
+                const char *field = anthropic ? "\"partial_json\":" : "\"arguments\":";
+                /* Inspect complete wire events, not the internal projection.
+                 * Each call must open once, retain its id and reassemble to the
+                 * same argument JSON as the authoritative non-stream parser. */
+                for (char *p = wire.ptr; p && *p;) {
+                    char *end = strchr(p, '\n');
+                    if (end) *end = '\0';
+                    if (!strncmp(p, "data: {", 7)) {
+                        const char *json = p + 6;
+                        char *value = NULL;
+                        TEST_ASSERT(json_raw_value(&json, &value));
+                        TEST_ASSERT(*json == '\0');
+                        free(value);
+                        if (strstr(p, "\"name\":")) {
+                            call_index++;
+                            TEST_ASSERT(call_index < calls.len);
+                            if (call_index < calls.len) TEST_ASSERT(calls.v[call_index].id && strstr(p, calls.v[call_index].id));
+                        }
+                        const char *arg = strstr(p, field);
+                        if (arg) {
+                            arg += strlen(field);
+                            char *frag = NULL;
+                            TEST_ASSERT(json_string(&arg, &frag));
+                            TEST_ASSERT(call_index >= 0 && call_index < 3);
+                            if (frag && call_index >= 0 && call_index < 3) buf_puts(&arguments[call_index], frag);
+                            free(frag);
+                        }
+                    }
+                    p = end ? end + 1 : NULL;
+                }
+                TEST_ASSERT(call_index == 2);
+                for (int i = 0; i < 3; i++) {
+                    char *actual = json_minify_raw_value(arguments[i].ptr);
+                    char *expected = i < calls.len ? json_minify_raw_value(calls.v[i].arguments) : NULL;
+                    TEST_ASSERT(actual && expected && !strcmp(actual, expected));
+                    free(actual);
+                    free(expected);
+                    buf_free(&arguments[i]);
+                }
+                free(content);
+                free(reasoning);
+                tool_calls_free(&calls);
+                openai_stream_free(&os);
+                anthropic_stream_free(&as);
+                request_free(&r);
+                buf_free(&wire);
+                buf_free(&raw);
+                close(sv[0]);
+                close(sv[1]);
+            }
+        }
+    }
+}
+
+static void test_qwen_tool_delta_length_limit(void) {
+    const char *raw = "<tool_call><function=bash><parameter=command>echo unfinished";
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        r.stream = r.has_tools = true;
+        r.think_mode = DS4_THINK_NONE;
+        r.tool_orders = make_bash_order();
+        if (anthropic) {
+            anthropic_stream st;
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "qwen_length", 10, &st));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "qwen_length", &st, raw, strlen(raw), false));
+            TEST_ASSERT(st.open_block == ANTH_BLOCK_TOOL && st.tool.index == 0);
+            TEST_ASSERT(anthropic_sse_finish_live(sv[0], NULL, &r, "qwen_length", &st, raw, strlen(raw), NULL, "length", 20));
+            TEST_ASSERT(st.open_block == ANTH_BLOCK_NONE && st.tool.index == 0);
+            anthropic_stream_free(&st);
+        } else {
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "qwen_length", &st, raw, strlen(raw), false));
+            TEST_ASSERT(st.tool.emitted_any && st.tool.index == 0);
+            TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "qwen_length", &st, raw, strlen(raw), NULL, "length", 10, 20));
+            openai_stream_free(&st);
+        }
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "echo unfinished") != NULL);
+        if (anthropic) {
+            const char *stop = strstr(out, "event: content_block_stop");
+            const char *done = strstr(out, "event: message_stop");
+            TEST_ASSERT(stop && done && stop < done);
+            TEST_ASSERT(strstr(out, "\"stop_reason\":\"max_tokens\"") != NULL);
+        } else {
+            TEST_ASSERT(strstr(out, "\"finish_reason\":\"length\"") != NULL);
+            TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+        }
+        free(out);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_qwen_stream_split_reasoning_close(void) {
     const char *raw = "<think>first pass</think>first answer chunk";
     const size_t split = strlen("<think>first pass</thi");
@@ -23123,6 +23552,8 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_incremental_text();
     test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_qwen_tool_stream_sends_answer_before_finish();
+    test_qwen_tool_argument_deltas();
+    test_qwen_tool_delta_length_limit();
     test_qwen_stream_split_reasoning_close();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
