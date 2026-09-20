@@ -38,6 +38,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Explain Redis streams."}],"stream":true}'
 ```
 
+Qwen tool arguments stream incrementally on Chat Completions (`tool_calls`
+deltas) and Anthropic (`input_json_delta`). Parameters declared as strings in
+the tool schema stream during generation; other parameters are emitted when
+their closing delimiter makes the JSON-or-string type unambiguous. Tool IDs
+remain stable across deltas and subsequent tool results. No extra flag is needed.
+The opt-in live test is `python3 tests/test_qwen_tool_deltas.py --base-url URL`
+(add `--thinking` to check reasoning-enabled requests).
+
 Chat, Responses, and Anthropic support tools and SSE streaming. Reasoning is
 returned separately from visible text in each API's native form. Standard
 sampling and output-budget fields are supported; explicit request parameters
@@ -142,6 +150,27 @@ part of the prefix.
 `--disable-exact-dsml-tool-replay` disables it for diagnostic comparisons.
 Use `--trace /tmp/ds4-trace.txt` to record prompt rendering, cache decisions,
 generated text, and tool-parser events. Traces can contain sensitive content.
+
+Live text-prefix reuse also handles image histories when sampled tokens and
+re-tokenized request text have different BPE spellings. Historical image blocks
+are matched at their transcript positions and checked against their stored
+fingerprints and row counts before the new suffix is appended. Qwen and GLM
+image start/end tokens are retained during that append. Changed or removed
+historical images still reject reuse; image-conditioned disk caching is not
+enabled by this fallback.
+
+The per-slot text key normalizes image markers and records their byte offsets
+after each request, so the shared routing/execution probe recognizes the same
+image prefix even when the next request carries fresh marker nonces.
+
+The short real-model regression covers text → PNG → WebP, sampled BPE drift,
+changed history, and cold replay:
+
+```sh
+make tests/test_server_vision_prefix
+./tests/test_server_vision_prefix MODEL.gguf MMPROJ.gguf
+./tests/test_server_vision_prefix MODEL.gguf MMPROJ.gguf 1024
+```
 
 Cache formats are implementation details. The current header and extension
 definitions are in [ds4_kvstore.h](../ds4_kvstore.h) and
